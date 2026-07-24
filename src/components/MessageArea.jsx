@@ -326,9 +326,9 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
                       <div className="flex flex-col gap-2 px-6 py-2 pb-6 animate-fade-in items-end">
                         {uploadingFiles.map((file) => (
                           <div key={file.id} className="flex flex-col items-start gap-2 px-4 py-3 bg-[#4f46e5]/10 border border-[#4f46e5]/20 text-[#4f46e5] rounded-2xl rounded-tr-sm w-fit max-w-[70%] shadow-sm">
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2 w-full min-w-0 max-w-full">
                               <div className="w-4 h-4 border-2 border-[#4f46e5]/30 border-t-[#4f46e5] rounded-full animate-spin shrink-0" />
-                              <span className="text-[13px] font-medium truncate">{file.name}</span>
+                              <span className="text-[13px] font-medium truncate flex-1 min-w-0">{file.name}</span>
                             </div>
                             <span className="text-[10px] opacity-70">Uploading...</span>
                           </div>
