@@ -2,6 +2,9 @@ import { createContext, useContext, useState, useEffect, useRef, useCallback } f
 import { supabase } from '../lib/supabase';
 import { useAuth } from './AuthContext';
 import { getUserColor, formatMessageTime, formatBytes, sortContacts } from '../utils/helpers';
+import { parsePoll, pollPreview, buildPollMessage, POLL_VOTE_PREFIX } from '../utils/poll';
+import { buildDisappearingMessage, computeExpiries, parseDisappearing } from '../utils/disappearing';
+import { CURSOR_ACTION, RECEIPT_ACTION, MUTE_ACTION, tsOf, parseReadState, addReceipt, receiptsForMessage, isMuteActive } from '../utils/readState';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 
 const ChatContext = createContext();
@@ -101,11 +104,42 @@ export function ChatProvider({ children }) {
   const [onlineUsers, setOnlineUsers] = useState({});
   const presenceChannelRef = useRef(null);
 
+  // "N new messages" divider: first unread message of the room at the moment it was opened
+  const [unreadMarker, setUnreadMarker] = useState(null); // { roomId, messageId, count }
+  const openSnapshotRef = useRef(new Map()); // roomId -> my read cursor (ISO or null) captured when the chat was opened
+
+  // Read state stored in the notifications table (see utils/readState.js)
+  const cursorsRef = useRef({}); // roomId -> { id, upTo }  (my own cursor rows)
+  const [peerReceipts, setPeerReceipts] = useState({}); // roomId -> userId -> [{ upTo, at }]
+  const contactsRef = useRef([]);
+  const receiptFlushRef = useRef({}); // roomId -> { last, timer }
+
+  // Muted chats (stored as '__mute' rows in the notifications table): roomId -> { id, until }
+  const [mutes, setMutes] = useState({});
+  const mutesRef = useRef({});
+  const [muteTick, setMuteTick] = useState(0);
+  useEffect(() => { mutesRef.current = mutes; }, [mutes]);
+  // Re-evaluate timed mutes so a mute switches off by itself when it expires
+  useEffect(() => {
+    if (Object.keys(mutes).length === 0) return;
+    const timer = setInterval(() => setMuteTick(t => t + 1), 30000);
+    return () => clearInterval(timer);
+  }, [mutes]);
+
+  // Multi-select: ids of the messages ticked in the current chat (empty = not selecting)
+  const [selectedIds, setSelectedIds] = useState([]);
+  const startSelect = useCallback((id) => setSelectedIds([id]), []);
+  const toggleSelect = useCallback((id) => {
+    setSelectedIds(prev => (prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]));
+  }, []);
+  const clearSelect = useCallback(() => setSelectedIds([]), []);
+
   // Clear temporary message states when switching chats
   useEffect(() => {
     setQuoteMessage(null);
     setEditingMessage(null);
     setForwardingMessage(null);
+    setSelectedIds([]);
   }, [activeContactId]);
 
   const markNotificationAsRead = useCallback(async (notifId) => {
@@ -292,16 +326,32 @@ export function ChatProvider({ children }) {
           lastMessages = msgs || [];
         }
 
+        // 4.4 Read state kept in the notifications table (my read cursors + receipts others sent me)
+        const { data: readRows } = await supabase
+          .from('notifications')
+          .select('id, action, sender_id, recipient_id, link_id, preview, created_at')
+          .in('action', [CURSOR_ACTION, RECEIPT_ACTION, MUTE_ACTION])
+          .or(`sender_id.eq.${companyUserId},recipient_id.eq.${companyUserId}`);
+        const readState = parseReadState(readRows, companyUserId);
+        cursorsRef.current = readState.cursors;
+        setPeerReceipts(readState.receipts);
+        setMutes(readState.mutes);
+
         // 4.5 Fetch unread messages to calculate badge counts
         const { data: unreadMessages } = await supabase
           .from('chat_messages')
-          .select('id, room_id, read_by_users')
+          .select('id, room_id, read_by_users, created_at, is_deleted, type, message')
           .neq('created_by', companyUserId);
 
         const getUnreadCountForRoom = (roomId) => {
           if (!roomId) return 0;
+          const cursor = readState.cursors[roomId];
           return (unreadMessages || []).filter(m => {
             if (m.room_id !== roomId) return false;
+            if (m.is_deleted) return false;
+            if (m.type === 'text' && parseDisappearing(m.message)) return false;
+            // Once a read cursor exists it is the source of truth; before that fall back to the old per-message receipts
+            if (cursor) return tsOf(m.created_at) > tsOf(cursor.upTo);
             const readList = m.read_by_users || [];
             const hasRead = readList.some(item => {
               const parsed = typeof item === 'string' ? JSON.parse(item) : item;
@@ -361,10 +411,10 @@ export function ChatProvider({ children }) {
           }
           
           // Strip markdown characters before returning
-          const cleanText = msgText
+          const cleanText = pollPreview(msgText)
             .replace(/\*([^*]+)\*/g, '$1')
             .replace(/_([^_]+)_/g, '$1');
-          
+
           return `${prefix}${cleanText}`;
         };
 
@@ -484,36 +534,83 @@ export function ChatProvider({ children }) {
     loadData();
   }, [companyUserId]);
 
-  const markMessagesAsRead = useCallback(async (roomId) => {
-    if (!roomId || !companyUserId) return;
+  useEffect(() => { contactsRef.current = contacts; }, [contacts]);
+
+  // Writes to my read cursor are serialised per room so two quick calls never create duplicate cursor rows
+  const cursorQueueRef = useRef({});
+  const queueCursorWrite = useCallback((roomId, upTo) => {
+    const run = async () => {
+      const existing = cursorsRef.current[roomId];
+      if (existing?.id) {
+        const ids = existing.ids?.length ? existing.ids : [existing.id];
+        const { error } = await supabase.from('notifications').update({ preview: upTo }).in('id', ids);
+        if (error) throw error;
+        cursorsRef.current[roomId] = { id: existing.id, upTo, ids };
+        return;
+      }
+      const { data, error } = await supabase
+        .from('notifications')
+        .insert({ recipient_id: companyUserId, sender_id: companyUserId, action: CURSOR_ACTION, link_id: roomId, preview: upTo, is_read: true })
+        .select('id')
+        .single();
+      if (error) throw error;
+      cursorsRef.current[roomId] = { id: data.id, upTo, ids: [data.id] };
+    };
+    const next = (cursorQueueRef.current[roomId] || Promise.resolve()).catch(() => {}).then(run);
+    cursorQueueRef.current[roomId] = next;
+    return next;
+  }, [companyUserId]);
+
+  // Move my read cursor to the newest incoming message and tell the other participants ("Seen by")
+  const flushRead = useCallback(async (roomId) => {
     try {
-      const { data: msgs } = await supabase
+      const { data: latest } = await supabase
         .from('chat_messages')
-        .select('id, read_by_users')
+        .select('created_at')
         .eq('room_id', roomId)
-        .neq('created_by', companyUserId);
+        .neq('created_by', companyUserId)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      const upTo = latest?.[0]?.created_at;
+      if (!upTo) return;
 
-      if (!msgs || msgs.length === 0) return;
+      const current = cursorsRef.current[roomId];
+      if (current && tsOf(current.upTo) >= tsOf(upTo)) return;
 
-      for (const m of msgs) {
-        const readList = m.read_by_users || [];
-        const alreadyRead = readList.some(item => {
-          const parsed = typeof item === 'string' ? JSON.parse(item) : item;
-          return parsed?.user_id === companyUserId;
-        });
+      await queueCursorWrite(roomId, upTo);
 
-        if (!alreadyRead) {
-          const updatedList = [...readList, { user_id: companyUserId, read_at: new Date().toISOString() }];
-          await supabase
-            .from('chat_messages')
-            .update({ read_by_users: updatedList })
-            .eq('id', m.id);
-        }
+      const contact = contactsRef.current.find(c => c.roomId === roomId);
+      const recipients = (contact ? (contact.isChannel ? (contact.participants || []) : [contact.id]) : [])
+        .filter(id => id && id !== companyUserId)
+        .slice(0, 50);
+      if (recipients.length > 0) {
+        const { error } = await supabase.from('notifications').insert(
+          recipients.map(rid => ({ recipient_id: rid, sender_id: companyUserId, action: RECEIPT_ACTION, link_id: roomId, preview: upTo, is_read: true }))
+        );
+        if (error) console.error('Error sending read receipt:', error);
       }
     } catch (err) {
-      console.error("Error marking messages as read:", err);
+      console.error('Error marking messages as read:', err);
     }
-  }, [companyUserId]);
+  }, [companyUserId, queueCursorWrite]);
+
+  // First call for a room goes out immediately; calls within 3s are coalesced into one trailing flush
+  const markMessagesAsRead = useCallback((roomId) => {
+    if (!roomId || !companyUserId) return;
+    const state = receiptFlushRef.current[roomId] || (receiptFlushRef.current[roomId] = { last: 0, timer: null });
+    const wait = state.last + 3000 - Date.now();
+    if (wait <= 0) {
+      state.last = Date.now();
+      return flushRead(roomId);
+    }
+    if (!state.timer) {
+      state.timer = setTimeout(() => {
+        state.timer = null;
+        state.last = Date.now();
+        flushRead(roomId);
+      }, wait);
+    }
+  }, [companyUserId, flushRead]);
 
   const sendTypingStatus = (isTyping) => {
     if (activeChannelRef.current) {
@@ -535,6 +632,8 @@ export function ChatProvider({ children }) {
     setActiveTab('chat');
     setIsFetchingChat(true);
     setAllMessages([]);
+    // Remember where my read cursor was before opening, so the "new messages" divider is not affected by marking as read
+    if (contact?.roomId) openSnapshotRef.current.set(contact.roomId, cursorsRef.current[contact.roomId]?.upTo ?? null);
     if (contact) {
       navigate(`/${activeNav}/${contact.id}`);
     } else {
@@ -550,6 +649,98 @@ export function ChatProvider({ children }) {
   }, [markMessagesAsRead, navigate, activeContactId, activeNav]);
 
   const setActiveContact = handleSelect;
+
+  // Put a chat back into the unread state by moving my read cursor to just before the newest incoming message.
+  // The cursor lives in the notifications table, so the badge survives reloads and other devices.
+  const handleMarkUnread = async (contact) => {
+    if (!contact) return;
+    const roomId = contact.roomId;
+    const wasOpen = contact.id === activeContactId;
+
+    setContacts(prev => prev.map(c => (c.id === contact.id ? { ...c, unread: Math.max(1, c.unread || 0) } : c)));
+    if (wasOpen) handleSelect(null);
+    if (!roomId) return;
+
+    try {
+      const { data: recent } = await supabase
+        .from('chat_messages')
+        .select('created_at, type, message')
+        .eq('room_id', roomId)
+        .neq('created_by', companyUserId)
+        .eq('is_deleted', false)
+        .order('created_at', { ascending: false })
+        .limit(10);
+
+      const incoming = (recent || []).filter(m => !(m.type === 'text' && parseDisappearing(m.message)));
+      if (incoming.length === 0) return;
+      openSnapshotRef.current.delete(roomId);
+      await queueCursorWrite(roomId, incoming[1]?.created_at ?? '1970-01-01T00:00:00.000Z');
+    } catch (err) {
+      console.error('Error marking chat as unread:', err);
+    }
+  };
+
+  const handleMarkRead = async (contact) => {
+    if (!contact) return;
+    setContacts(prev => prev.map(c => (c.id === contact.id ? { ...c, unread: 0 } : c)));
+    if (contact.roomId) await flushRead(contact.roomId);
+  };
+
+  const isRoomMuted = useCallback(
+    (roomId) => !!roomId && isMuteActive(mutes[roomId]),
+    // muteTick makes timed mutes expire without any other state change
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [mutes, muteTick]
+  );
+
+  // duration: milliseconds, 'forever', or null to unmute
+  const handleMuteChat = async (contact, duration) => {
+    const roomId = contact?.roomId;
+    if (!roomId || !companyUserId) return;
+    const existing = mutesRef.current[roomId];
+
+    try {
+      if (duration === null) {
+        setMutes(prev => {
+          const next = { ...prev };
+          delete next[roomId];
+          return next;
+        });
+        if (existing?.id) {
+          const ids = existing.ids?.length ? existing.ids : [existing.id];
+          const { error } = await supabase.from('notifications').delete().in('id', ids);
+          if (error) throw error;
+        }
+        return;
+      }
+
+      const until = duration === 'forever' ? 'forever' : new Date(Date.now() + duration).toISOString();
+      if (existing?.id) {
+        const ids = existing.ids?.length ? existing.ids : [existing.id];
+        setMutes(prev => ({ ...prev, [roomId]: { id: existing.id, until, ids } }));
+        const { error } = await supabase.from('notifications').update({ preview: until }).in('id', ids);
+        if (error) throw error;
+        return;
+      }
+      setMutes(prev => ({ ...prev, [roomId]: { id: null, until } }));
+      const { data, error } = await supabase
+        .from('notifications')
+        .insert({ recipient_id: companyUserId, sender_id: companyUserId, action: MUTE_ACTION, link_id: roomId, preview: until, is_read: true })
+        .select('id')
+        .single();
+      if (error) throw error;
+      setMutes(prev => (prev[roomId] ? { ...prev, [roomId]: { id: data.id, until: prev[roomId].until, ids: [data.id] } } : prev));
+    } catch (err) {
+      console.error('Error updating mute:', err);
+      setChatAlert({ message: 'Could not update mute setting. Please try again.' });
+    }
+  };
+
+  // Who has read this message of mine: legacy per-message receipts plus cursor receipts from the notifications table
+  const getMessageReceipts = useCallback(
+    (message) => receiptsForMessage(message, peerReceipts[currentContact?.roomId]),
+    [peerReceipts, currentContact?.roomId]
+  );
 
   const getOrCreateRoomForContact = async (contact) => {
     if (contact.roomId) return contact.roomId;
@@ -590,8 +781,9 @@ export function ChatProvider({ children }) {
     return roomId;
   };
 
-  const handleSend = async (text, files) => {
+  const handleSend = async (text, files, { skipQuote = false } = {}) => {
     if (!currentContact) return;
+    const replyToId = skipQuote ? null : (quoteMessage?.id || null);
 
     try {
       let roomId = currentContact.roomId;
@@ -622,9 +814,9 @@ export function ChatProvider({ children }) {
             .insert({ 
               room_id: roomId, 
               created_by: companyUserId, 
-              message: JSON.stringify(fileMeta), 
+              message: JSON.stringify(fileMeta),
               type: 'file',
-              reply_to_message_id: quoteMessage?.id || null
+              reply_to_message_id: replyToId
             })
             .select()
             .single();
@@ -658,9 +850,9 @@ export function ChatProvider({ children }) {
           .insert({ 
             room_id: roomId, 
             created_by: companyUserId, 
-            message: text, 
+            message: text,
             type: 'text',
-            reply_to_message_id: quoteMessage?.id || null
+            reply_to_message_id: replyToId
           })
           .select()
           .single();
@@ -700,7 +892,7 @@ export function ChatProvider({ children }) {
 
       const latestMsg = newMsgText || lastUploadedMsg;
       if (latestMsg) {
-        setQuoteMessage(null);
+        if (!skipQuote) setQuoteMessage(null);
         await supabase.from('chat_rooms').update({ last_message_id: latestMsg.id }).eq('id', roomId);
 
         setContacts(prev => {
@@ -708,7 +900,7 @@ export function ChatProvider({ children }) {
             if (c.id === currentContact.id || c.roomId === roomId) {
               let preview = '';
               if (newMsgText) {
-                const cleanText = text
+                const cleanText = pollPreview(text)
                   .replace(/\*([^*]+)\*/g, '$1')
                   .replace(/_([^_]+)_/g, '$1');
                 preview = `You: ${cleanText}`;
@@ -933,8 +1125,14 @@ export function ChatProvider({ children }) {
     async function loadMessages() {
       // Clear old messages before fetching new ones so we don't show previous chat
       setAllMessages([]);
+      setUnreadMarker(null);
       setIsFetchingChat(true);
-      
+
+      // Captured before anything marks the chat as read (opened by click: snapshot from handleSelect; by URL: current cursor)
+      const cursorAtOpen = openSnapshotRef.current.has(currentContact.roomId)
+        ? openSnapshotRef.current.get(currentContact.roomId)
+        : (cursorsRef.current[currentContact.roomId]?.upTo ?? null);
+
       if (!currentContact.roomId) {
         setIsFetchingChat(false);
         return;
@@ -1002,6 +1200,19 @@ export function ChatProvider({ children }) {
             }),
           };
         });
+        // Where the "new messages" divider goes: everything newer than my read cursor as it was when the chat was opened.
+        // Rooms without a cursor yet fall back to the old per-message receipts.
+        const incoming = formatted.filter(m => m.senderId !== 'me' && !m.isDeleted && !(m.type === 'text' && parseDisappearing(m.text)));
+        const unreadIncoming = cursorAtOpen
+          ? incoming.filter(m => tsOf(m.createdAt) > tsOf(cursorAtOpen))
+          : incoming.filter(m => !(m.readByUsers || []).some(item => {
+              const parsed = typeof item === 'string' ? JSON.parse(item) : item;
+              return parsed?.user_id === companyUserId;
+            }));
+        openSnapshotRef.current.delete(currentContact.roomId);
+        setUnreadMarker(unreadIncoming.length > 0
+          ? { roomId: currentContact.roomId, messageId: unreadIncoming[0].id, count: unreadIncoming.length }
+          : null);
         setAllMessages(formatted);
         setIsFetchingChat(false);
       }
@@ -1242,7 +1453,7 @@ export function ChatProvider({ children }) {
                         color: getUserColor(room.id),
                         status: null,
                         role: 'Channel',
-                        lastMessage: m.type === 'file' ? fileLabel : m.message.replace(/\*([^*]+)\*/g, '$1').replace(/_([^_]+)_/g, '$1'),
+                        lastMessage: m.type === 'file' ? fileLabel : pollPreview(m.message).replace(/\*([^*]+)\*/g, '$1').replace(/_([^_]+)_/g, '$1'),
                         timestamp: formatMessageTime(m.created_at),
                         rawTimestamp: m.created_at,
                         unread: m.created_by !== companyUserId ? 1 : 0,
@@ -1278,7 +1489,7 @@ export function ChatProvider({ children }) {
                             status: cu.is_active ? 'online' : 'offline',
                             role: cu.department || cu.designation || 'Colleague',
                             lastSeen: cu.is_active ? 'Online' : 'Offline',
-                            lastMessage: m.type === 'file' ? fileLabel : m.message.replace(/\*([^*]+)\*/g, '$1').replace(/_([^_]+)_/g, '$1'),
+                            lastMessage: m.type === 'file' ? fileLabel : pollPreview(m.message).replace(/\*([^*]+)\*/g, '$1').replace(/_([^_]+)_/g, '$1'),
                             timestamp: formatMessageTime(m.created_at),
                             rawTimestamp: m.created_at,
                             unread: m.created_by !== companyUserId ? 1 : 0,
@@ -1335,11 +1546,11 @@ export function ChatProvider({ children }) {
                       }
                     }
                   }
-                  text = text
+                  text = pollPreview(text)
                     .replace(/\*([^*]+)\*/g, '$1')
                     .replace(/_([^_]+)_/g, '$1');
                 }
-                
+
                 if (c.isChannel) {
                   const sender = prev.find(x => x.id === m.created_by) || (m.created_by === companyUserId ? currentUser : null);
                   const senderName = sender ? (m.created_by === companyUserId ? 'You' : sender.name.split(' ')[0]) : 'Someone';
@@ -1347,7 +1558,7 @@ export function ChatProvider({ children }) {
                 } else if (m.created_by === companyUserId) {
                   text = `You: ${text}`;
                 }
-                
+
                 const isIncomingFromOtherRoom = m.created_by !== companyUserId && 
                                                 currentContact?.roomId !== m.room_id && 
                                                 currentContact?.id !== c.id;
@@ -1370,7 +1581,7 @@ export function ChatProvider({ children }) {
           if (m.created_by !== companyUserId) {
             supabase.from('chat_rooms').select('participants').eq('id', m.room_id).single().then(({ data: roomData }) => {
               if (roomData && roomData.participants && roomData.participants.includes(companyUserId)) {
-                if ('Notification' in window && Notification.permission === 'granted') {
+                if ('Notification' in window && Notification.permission === 'granted' && !isMuteActive(mutesRef.current[m.room_id])) {
                   if (document.visibilityState === 'hidden' || currentContact?.roomId !== m.room_id) {
                     supabase
                       .from('company_users')
@@ -1439,7 +1650,7 @@ export function ChatProvider({ children }) {
                       }
                     }
                   }
-                  text = (text || '')
+                  text = pollPreview(text || '')
                     .replace(/\*([^*]+)\*/g, '$1')
                     .replace(/_([^_]+)_/g, '$1');
                 }
@@ -1529,6 +1740,11 @@ export function ChatProvider({ children }) {
 
           if (payload.eventType === 'INSERT') {
             const newNotif = payload.new;
+            // Someone read my messages: update "Seen by" / ticks live
+            if (newNotif.action === RECEIPT_ACTION) {
+              setPeerReceipts(prev => addReceipt(prev, newNotif));
+              return;
+            }
             const act = (newNotif.action || '').toLowerCase();
             if (!act.includes('mention') && !act.includes('react')) return;
 
@@ -1564,7 +1780,9 @@ export function ChatProvider({ children }) {
               setNotifications(prev => [formatted, ...prev]);
 
             // Trigger Chrome notification for mentions/reactions
-            if ('Notification' in window && Notification.permission === 'granted' && document.visibilityState === 'hidden') {
+            // Muted chats still notify for @mentions, but not for reactions
+            const mutedReaction = act.includes('react') && isMuteActive(mutesRef.current[newNotif.link_id]);
+            if ('Notification' in window && Notification.permission === 'granted' && document.visibilityState === 'hidden' && !mutedReaction) {
               const bodyText = `${formatted.emoji} ${formatted.action}: "${formatted.preview}"`;
               const desktopNotif = new Notification(formatted.name, {
                 body: bodyText,
@@ -1587,6 +1805,54 @@ export function ChatProvider({ children }) {
 
     return () => supabase.removeChannel(channel);
   }, [companyUserId, setActiveNav]);
+
+  const handleSendPoll = async ({ question, options, multi }) => {
+    await handleSend(buildPollMessage({ question, options, multi }), []);
+  };
+
+  // Votes are stored as { user_id, reaction: "poll:<idx>" } entries in reaction_by_users.
+  // Single-choice polls keep one entry per user; multi-choice polls keep one per chosen option.
+  const handleVotePoll = async (messageId, optionIdx) => {
+    try {
+      const { data: msg, error: fetchErr } = await supabase
+        .from('chat_messages')
+        .select('reaction_by_users, message')
+        .eq('id', messageId)
+        .single();
+      if (fetchErr) throw fetchErr;
+
+      const poll = parsePoll(msg.message);
+      if (!poll || optionIdx < 0 || optionIdx >= poll.options.length) return;
+
+      const key = `${POLL_VOTE_PREFIX}${optionIdx}`;
+      const entries = (msg.reaction_by_users || []).map(r => (typeof r === 'string' ? JSON.parse(r) : r));
+      const isMyVote = (r) => r?.user_id === companyUserId && String(r?.reaction).startsWith(POLL_VOTE_PREFIX);
+      const alreadyVoted = entries.some(r => isMyVote(r) && r.reaction === key);
+
+      let updated;
+      if (alreadyVoted) {
+        updated = entries.filter(r => !(isMyVote(r) && r.reaction === key));
+      } else if (poll.multi) {
+        updated = [...entries, { user_id: companyUserId, reaction: key, reacted_at: new Date().toISOString() }];
+      } else {
+        updated = [
+          ...entries.filter(r => !isMyVote(r)),
+          { user_id: companyUserId, reaction: key, reacted_at: new Date().toISOString() },
+        ];
+      }
+
+      const { error: updateErr } = await supabase
+        .from('chat_messages')
+        .update({ reaction_by_users: updated })
+        .eq('id', messageId);
+      if (updateErr) throw updateErr;
+
+      setAllMessages(prev => prev.map(m => (m.id === messageId ? { ...m, reactions: updated } : m)));
+    } catch (err) {
+      console.error('Error voting on poll:', err);
+      setChatAlert({ message: 'Could not save your vote. Please try again.' });
+    }
+  };
 
   const handleToggleReaction = async (messageId, emoji) => {
     try {
@@ -1714,6 +1980,43 @@ export function ChatProvider({ children }) {
       console.error("Error deleting message:", err);
     }
   };
+
+  // Disappearing messages: the timer is a system message (see utils/disappearing.js); set it for this chat.
+  const handleSetDisappearing = async (secs) => {
+    await handleSend(buildDisappearingMessage(secs), [], { skipQuote: true });
+  };
+
+  // Sender-side cleanup: soft-delete my own messages once they expire so they vanish for everyone (even after reload).
+  // Every client also hides expired messages on its own, so this only matters for permanence.
+  const [expiryTick, setExpiryTick] = useState(0);
+  const failedExpiryIdsRef = useRef(new Set());
+  useEffect(() => {
+    const { expiresAt } = computeExpiries(allMessages);
+    const mine = allMessages.filter(m => m.senderId === 'me' && !m.isDeleted && expiresAt.has(m.id) && !failedExpiryIdsRef.current.has(m.id));
+    if (mine.length === 0) return;
+
+    const now = Date.now();
+    const due = mine.filter(m => expiresAt.get(m.id) <= now).map(m => m.id);
+    if (due.length > 0) {
+      supabase
+        .from('chat_messages')
+        .update({ is_deleted: true, deleted_at: new Date().toISOString(), is_pinned: false })
+        .in('id', due)
+        .then(({ error }) => {
+          if (error) {
+            console.error('Error expiring messages:', error);
+            due.forEach(id => failedExpiryIdsRef.current.add(id));
+            return;
+          }
+          setAllMessages(prev => prev.map(m => (due.includes(m.id) ? { ...m, isDeleted: true, isPinned: false } : m)));
+        });
+      return;
+    }
+
+    const next = Math.min(...mine.map(m => expiresAt.get(m.id)));
+    const timer = setTimeout(() => setExpiryTick(t => t + 1), Math.min(Math.max(next - now + 100, 100), 2147483647));
+    return () => clearTimeout(timer);
+  }, [allMessages, expiryTick]);
 
   const handleToggleStar = async (messageId) => {
     try {
@@ -1882,8 +2185,13 @@ export function ChatProvider({ children }) {
     scrollToMessageId, setScrollToMessageId,
     uploadingFiles,
     onlineUsers,
+    unreadMarker,
     drafts, saveDraft,
     markNotificationAsRead, markAllNotificationsAsRead,
+    handleMarkUnread, handleMarkRead, getMessageReceipts,
+    isRoomMuted, handleMuteChat,
+    selectedIds, startSelect, toggleSelect, clearSelect,
+    handleSendPoll, handleVotePoll, handleSetDisappearing,
     handleSend, handleFileUpload, handleSelect, sendTypingStatus, handleCreateGroup, handleToggleReaction,
     handleEditMessage, handleDeleteMessage, handleToggleStar, handleForwardMessage, handleTogglePin, handleAddParticipantToGroup,
     globalSharedFile, setGlobalSharedFile

@@ -2,7 +2,9 @@ import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import clsx from 'clsx';
 import { FileCard } from './FileCard';
-import { Smile, ChevronLeft, ChevronRight, MoreVertical, Pencil, Quote, Share2, Copy, Star, Trash2, CornerUpRight, Pin, Reply, X } from 'lucide-react';
+import { PollCard } from './PollCard';
+import { MessageInfoModal } from './MessageInfoModal';
+import { parsePoll, pollPreview } from '../../utils/poll';import { Smile, ChevronLeft, ChevronRight, MoreVertical, Info, CheckSquare, Pencil, Quote, Share2, Copy, Star, Trash2, CornerUpRight, Pin, Reply, X } from 'lucide-react';
 import { useChat } from '../../context/ChatContext';
 import { Emoji } from 'emoji-picker-react';
 
@@ -91,6 +93,18 @@ function renderMessageText(text, contacts = [], isMe = false) {
   }
   escaped = processedLines.join('\n');
 
+  // 2.5 Pull URLs out behind placeholders so bold/italic/mention parsing cannot mangle them
+  // (e.g. underscores inside a link), then turn them into anchors at the end.
+  const links = [];
+  escaped = escaped.replace(/\b(?:https?:\/\/|www\.)[^\s<"]+/gi, (raw) => {
+    // Trailing punctuation / escaped brackets belong to the sentence, not the URL
+    const trailing = raw.match(/(?:[.,;:!?)\]]|&gt;|&lt;)+$/)?.[0] || '';
+    const url = trailing ? raw.slice(0, -trailing.length) : raw;
+    if (!/^(?:https?:\/\/|www\.)[^\s]+\.[^\s]+/i.test(url)) return raw;
+    links.push(url);
+    return `${links.length - 1}${trailing}`;
+  });
+
   // 3. Parse the formatted content with boundary-safe Regex expressions sequentially
   const boldRegex = /(?<!\w)\*(\S(?:.*?\S)?)\*(?!\w)/g;
   const italicRegex = /(?<!\w)_(\S(?:.*?\S)?)_(?!\w)/g;
@@ -134,6 +148,17 @@ function renderMessageText(text, contacts = [], isMe = false) {
     return `<span class="${badgeClass}">${match}</span>`;
   });
 
+  if (links.length > 0) {
+    const linkClass = isMe
+      ? 'underline underline-offset-2 break-all font-medium text-white hover:text-indigo-100'
+      : 'underline underline-offset-2 break-all font-medium text-indigo-600 hover:text-indigo-800';
+    escaped = escaped.replace(/(\d+)/g, (_, i) => {
+      const shown = links[Number(i)];
+      const href = /^https?:\/\//i.test(shown) ? shown : `https://${shown}`;
+      return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="${linkClass}">${shown}</a>`;
+    });
+  }
+
   return <span dangerouslySetInnerHTML={{ __html: escaped }} />;
 }
 
@@ -151,8 +176,14 @@ export function MessageBubble({ message, isMe, tick, onViewFile, isHighlighted, 
     handleTogglePin,
     setScrollToMessageId,
     setQuoteMessage,
+    handleVotePoll,
+    getMessageReceipts,
+    startSelect,
+    currentContact,
     contacts
   } = useChat();
+
+  const poll = message.type === 'text' ? parsePoll(message.text) : null;
 
   const [showPopover, setShowPopover] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
@@ -161,6 +192,7 @@ export function MessageBubble({ message, isMe, tick, onViewFile, isHighlighted, 
   const [menuDirection, setMenuDirection] = useState('down'); // 'up' or 'down'
   const [menuPos, setMenuPos] = useState(null); // { x, y }
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
 
   // Close context menu and reactions popover when clicking anywhere else or scrolling
   useEffect(() => {
@@ -223,7 +255,7 @@ export function MessageBubble({ message, isMe, tick, onViewFile, isHighlighted, 
 
   // Time constraint: can edit only within 5 minutes of sending
   const timeDiffMinutes = (new Date() - new Date(message.createdAt)) / 60000;
-  const canEdit = isMe && (timeDiffMinutes < 5) && (message.type !== 'file');
+  const canEdit = isMe && (timeDiffMinutes < 5) && (message.type !== 'file') && !poll;
 
   if (message.isDeleted) {
     return (
@@ -243,7 +275,8 @@ export function MessageBubble({ message, isMe, tick, onViewFile, isHighlighted, 
   const reactionsMap = {};
   rawReactions.forEach(r => {
     const parsed = typeof r === 'string' ? JSON.parse(r) : r;
-    if (parsed?.reaction) {
+    // Poll votes share this column but are not emoji reactions
+    if (parsed?.reaction && !String(parsed.reaction).startsWith('poll:')) {
       if (!reactionsMap[parsed.reaction]) {
         reactionsMap[parsed.reaction] = { count: 0, userIds: [] };
       }
@@ -295,7 +328,7 @@ export function MessageBubble({ message, isMe, tick, onViewFile, isHighlighted, 
                   className="cursor-pointer w-full text-left bg-black/5 rounded-md px-2 py-1.5 border-l-2 border-indigo-400 opacity-90 hover:opacity-100 transition-opacity"
                 >
                   <div className="text-[10px] font-bold text-indigo-700">{replySender}</div>
-                  <div className="text-[11px] line-clamp-4 text-slate-700">{replyToMessage.text || 'Attachment'}</div>
+                  <div className="text-[11px] line-clamp-4 text-slate-700">{pollPreview(replyToMessage.text) || 'Attachment'}</div>
                 </div>
               </div>
             );
@@ -358,7 +391,7 @@ export function MessageBubble({ message, isMe, tick, onViewFile, isHighlighted, 
                   className="cursor-pointer w-full text-left bg-black/5 rounded-md px-2 py-1.5 border-l-2 border-indigo-400 opacity-90 hover:opacity-100 transition-opacity"
                 >
                   <div className="text-[10px] font-bold text-indigo-700">{replySender}</div>
-                  <div className="text-[11px] truncate text-slate-700">{replyToMessage.text || 'Attachment'}</div>
+                  <div className="text-[11px] truncate text-slate-700">{pollPreview(replyToMessage.text) || 'Attachment'}</div>
                 </div>
               </div>
             );
@@ -422,14 +455,24 @@ export function MessageBubble({ message, isMe, tick, onViewFile, isHighlighted, 
                   )}
                 >
                   <div className={clsx("text-[11px] font-bold", isMe ? "text-white" : "text-indigo-600")}>{replySender}</div>
-                  <div className="text-[12px] md:text-[11px] line-clamp-2 opacity-90 leading-snug mt-0.5">{replyToMessage.text || 'Attachment'}</div>
+                  <div className="text-[12px] md:text-[11px] line-clamp-2 opacity-90 leading-snug mt-0.5">{pollPreview(replyToMessage.text) || 'Attachment'}</div>
                 </div>
               </div>
             );
         })()}
 
         <div className="mb-0.5">
-          {(() => {
+          {poll ? (
+            <PollCard
+              poll={poll}
+              reactions={message.reactions}
+              isMe={isMe}
+              myUserId={companyUserId}
+              contacts={contacts}
+              currentUser={currentUser}
+              onVote={(idx) => handleVotePoll(message.id, idx)}
+            />
+          ) : (() => {
             const allUsers = [...contacts];
             if (currentUser && !allUsers.some(u => u.id === currentUser.id)) {
               allUsers.push(currentUser);
@@ -534,7 +577,31 @@ export function MessageBubble({ message, isMe, tick, onViewFile, isHighlighted, 
         Forward
       </button>
 
-      {message.type !== 'file' && (
+      <button
+        onClick={() => {
+          startSelect(message.id);
+          setShowMenu(false);
+        }}
+        className="w-full px-3 py-1.5 flex items-center gap-2 text-left text-[12px] text-[#475569] hover:bg-slate-50 transition-colors font-medium"
+      >
+        <CheckSquare size={12} className="text-slate-400" />
+        Select
+      </button>
+
+      {isMe && (
+        <button
+          onClick={() => {
+            setShowInfo(true);
+            setShowMenu(false);
+          }}
+          className="w-full px-3 py-1.5 flex items-center gap-2 text-left text-[12px] text-[#475569] hover:bg-slate-50 transition-colors font-medium"
+        >
+          <Info size={12} className="text-slate-400" />
+          Info
+        </button>
+      )}
+
+      {message.type !== 'file' && !poll && (
         <button
           onClick={() => {
             navigator.clipboard.writeText(message.text || '');
@@ -604,7 +671,7 @@ export function MessageBubble({ message, isMe, tick, onViewFile, isHighlighted, 
       )}>
 
         {/* Smile Button and Popover */}
-        {!isMe && (
+        {!isMe && !poll && (
           <div className="relative">
             <button
               onClick={(e) => {
@@ -757,6 +824,17 @@ export function MessageBubble({ message, isMe, tick, onViewFile, isHighlighted, 
 
       {/* Right-click Context Dropdown */}
       {menuPos && dropdownMenuNode}
+
+      {showInfo && (
+        <MessageInfoModal
+          message={message}
+          readBy={getMessageReceipts(message)}
+          contact={currentContact}
+          contacts={contacts}
+          myUserId={companyUserId}
+          onClose={() => setShowInfo(false)}
+        />
+      )}
 
       {/* Delete Confirmation Modal */}
       {showDeleteConfirm && createPortal(

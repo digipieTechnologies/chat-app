@@ -8,8 +8,9 @@ export function ForwardSidebar() {
   const { 
     contacts, 
     forwardingMessage, 
-    setForwardingMessage, 
-    handleForwardMessage 
+    setForwardingMessage,
+    handleForwardMessage,
+    clearSelect
   } = useChat();
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -37,11 +38,20 @@ export function ForwardSidebar() {
     setSelected(prev => prev.filter(x => x.id !== contactId));
   };
 
-  const handleSendForward = () => {
+  // forwardingMessage is one message, or { __multi: true, messages: [...] } when forwarding a selection
+  const isMulti = !!forwardingMessage.__multi;
+
+  const handleSendForward = async () => {
     if (selected.length === 0) return;
-    handleForwardMessage(forwardingMessage, selected);
+    const targets = selected;
+    const toSend = isMulti ? forwardingMessage.messages : [forwardingMessage];
     setForwardingMessage(null);
     setSelected([]);
+    if (isMulti) clearSelect();
+    // Sequential, oldest first, so the forwarded messages keep their order
+    for (const message of toSend) {
+      await handleForwardMessage(message, targets);
+    }
   };
 
   return (
@@ -49,7 +59,9 @@ export function ForwardSidebar() {
       
       {/* Title Header */}
       <div className="px-5 py-4 border-b border-[#e2e8f0] flex items-center justify-between">
-        <h2 className="text-[15px] font-bold text-[#0f172a]">Forward Message</h2>
+        <h2 className="text-[15px] font-bold text-[#0f172a]">
+          {isMulti ? `Forward ${forwardingMessage.messages.length} messages` : 'Forward Message'}
+        </h2>
         <button 
           onClick={() => setForwardingMessage(null)}
           className="text-[#94a3b8] hover:text-[#475569] transition-colors p-1 rounded-lg hover:bg-slate-50"

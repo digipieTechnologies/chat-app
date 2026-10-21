@@ -12,7 +12,7 @@ const TABS = [
 ];
 
 export function ChatList({ contacts = [], activeContactId, onSelectContact }) {
-  const { handleCreateGroup, loading } = useChat();
+  const { handleCreateGroup, loading, handleMarkUnread, handleMarkRead, isRoomMuted, handleMuteChat } = useChat();
   const [activeTab, setActiveTab]     = useState('all');
   const [query, setQuery]             = useState('');
   const [showModal, setShowModal]     = useState(false);
@@ -113,6 +113,10 @@ export function ChatList({ contacts = [], activeContactId, onSelectContact }) {
               contact={c}
               isActive={c.id === activeContactId}
               onClick={() => onSelectContact(c)}
+              onMarkUnread={handleMarkUnread}
+              onMarkRead={handleMarkRead}
+              muted={isRoomMuted(c.roomId)}
+              onMute={handleMuteChat}
             />
           ))
         )}

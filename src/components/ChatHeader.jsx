@@ -1,10 +1,11 @@
 import { useState, useEffect } from 'react';
-import { Star, FolderOpen, MessageSquare, Search, ChevronLeft } from 'lucide-react';
+import { Star, FolderOpen, MessageSquare, Search, ChevronLeft, Timer, Check } from 'lucide-react';
 import clsx from 'clsx';
 import { Avatar } from './ui/Avatar';
 import { ContactDetailsDrawer } from './chat/ContactDetailsDrawer';
 import { useChat } from '../context/ChatContext';
 import { supabase } from '../lib/supabase';
+import { DISAPPEAR_OPTIONS, computeExpiries, durationLabel } from '../utils/disappearing';
 
 const TABS = [
   { id: 'chat',    icon: MessageSquare, label: 'Chat'    },
@@ -17,7 +18,17 @@ const STATUS_COLOR = { online: 'text-[#2eb67d]', busy: 'text-[#e01e5a]', away: '
 
 export function ChatHeader({ contact, activeTab, onTabChange }) {
   const [showDetails, setShowDetails] = useState(false);
-  const { isSearchOpen, setIsSearchOpen, setActiveContact, onlineUsers } = useChat();
+  const { isSearchOpen, setIsSearchOpen, setActiveContact, onlineUsers, allMessages, handleSetDisappearing } = useChat();
+  const [timerMenuOpen, setTimerMenuOpen] = useState(false);
+  const disappearSecs = computeExpiries(allMessages).currentSecs;
+
+  useEffect(() => {
+    if (!timerMenuOpen) return;
+    const close = () => setTimerMenuOpen(false);
+    document.addEventListener('click', close);
+    return () => document.removeEventListener('click', close);
+  }, [timerMenuOpen]);
+
   const [lastSeen, setLastSeen] = useState(null);
   const [hrmsStatus, setHrmsStatus] = useState(null);
   const [isLoadingPresence, setIsLoadingPresence] = useState(true);
@@ -157,7 +168,48 @@ export function ChatHeader({ contact, activeTab, onTabChange }) {
         </div>
         </div>
         
-        <div className="flex items-center ml-2 md:ml-4">
+        <div className="flex items-center gap-1 ml-2 md:ml-4">
+          <div className="relative">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setTimerMenuOpen(v => !v);
+              }}
+              title={disappearSecs > 0 ? `Disappearing messages: ${durationLabel(disappearSecs)}` : 'Disappearing messages'}
+              className={clsx(
+                "flex items-center justify-center w-8 h-8 rounded-full transition-colors",
+                disappearSecs > 0 || timerMenuOpen ? "bg-[#eef2ff] text-[#4f46e5]" : "text-[#64748b] hover:text-[#0f172a] hover:bg-[#e2e8f0]"
+              )}
+            >
+              <Timer size={17} strokeWidth={2.5} />
+            </button>
+
+            {timerMenuOpen && (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className="absolute right-0 top-full mt-1 z-50 w-[210px] bg-white border border-[#e2e8f0] rounded-lg shadow-lg py-1 animate-scale-in cursor-default"
+              >
+                <div className="px-3 pt-1.5 pb-1">
+                  <p className="text-[12px] font-bold text-[#0f172a]">Disappearing messages</p>
+                  <p className="text-[11px] text-[#64748b] leading-snug mt-0.5">New messages in this chat will disappear after the time you pick.</p>
+                </div>
+                {DISAPPEAR_OPTIONS.map(opt => (
+                  <button
+                    key={opt.secs}
+                    onClick={() => {
+                      setTimerMenuOpen(false);
+                      if (opt.secs !== disappearSecs) handleSetDisappearing(opt.secs);
+                    }}
+                    className="w-full px-3 py-1.5 flex items-center justify-between text-left text-[12px] text-[#475569] hover:bg-slate-50 transition-colors font-medium"
+                  >
+                    {opt.label}
+                    {opt.secs === disappearSecs && <Check size={13} className="text-[#4f46e5]" strokeWidth={3} />}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
           <button
             onClick={(e) => {
               e.stopPropagation();

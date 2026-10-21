@@ -1,11 +1,14 @@
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
-import { Check, CheckCheck, Search, X, ChevronUp, ChevronDown, Pin } from 'lucide-react';
+import { createPortal } from 'react-dom';
+import { Check, CheckCheck, Search, X, ChevronUp, ChevronDown, Pin, Timer, Copy, Share2, Star, Trash2 } from 'lucide-react';
 import clsx from 'clsx';
 import { Virtuoso } from 'react-virtuoso';
 import { Avatar } from './ui/Avatar';
 import { DateDivider } from './chat/DateDivider';
 import { MessageBubble } from './chat/MessageBubble';
 import { useChat } from '../context/ChatContext';
+import { pollPreview } from '../utils/poll';
+import { parseDisappearing, computeExpiries, disappearingNotice } from '../utils/disappearing';
 
 function getDateLabel(isoString) {
   if (!isoString) return 'Today';
@@ -25,33 +28,85 @@ function getDateLabel(isoString) {
   return date.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 }
 
-function groupMessages(messages) {
+function groupMessages(messages, firstUnreadId) {
   const groups = [];
   messages.forEach(msg => {
     const dateLabel = getDateLabel(msg.createdAt);
     const last = groups[groups.length - 1];
-    if (last && last.senderId === msg.senderId && last.dateLabel === dateLabel) {
+    const startsUnread = msg.id === firstUnreadId;
+    // Disappearing-messages setting: a centred notice that never merges with neighbouring bubbles
+    const setting = msg.type === 'text' ? parseDisappearing(msg.text) : null;
+    if (setting) {
+      groups.push({ senderId: msg.senderId, dateLabel, items: [msg], startsUnread, system: setting });
+      return;
+    }
+    if (last && !last.system && !startsUnread && last.senderId === msg.senderId && last.dateLabel === dateLabel) {
       last.items.push(msg);
     } else {
-      groups.push({ senderId: msg.senderId, dateLabel, items: [msg] });
+      groups.push({ senderId: msg.senderId, dateLabel, items: [msg], startsUnread });
     }
   });
   return groups;
 }
 
+function UnreadDivider({ count }) {
+  return (
+    <div id="unread-divider" className="flex items-center gap-3 px-6 py-2 select-none animate-fade-in">
+      <div className="flex-1 h-px bg-indigo-200" />
+      <span className="text-[11px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 rounded-full px-3 py-0.5">
+        {count > 0 ? `${count} new message${count === 1 ? '' : 's'}` : 'New messages'}
+      </span>
+      <div className="flex-1 h-px bg-indigo-200" />
+    </div>
+  );
+}
+
 export function MessageArea({ messages, contact, currentUser, contacts = [], typingUsers = [], onViewFile, isSearchOpen, setIsSearchOpen }) {
   const virtuosoRef = useRef(null);
-  const { handleTogglePin, isFetchingChat, scrollToMessageId, setScrollToMessageId, uploadingFiles } = useChat();
+  const { handleTogglePin, isFetchingChat, scrollToMessageId, setScrollToMessageId, uploadingFiles, unreadMarker, getMessageReceipts,
+    selectedIds, toggleSelect, clearSelect, setForwardingMessage, handleDeleteMessage, handleToggleStar, setChatAlert } = useChat();
+  const selectMode = selectedIds.length > 0;
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [activeMatchIndex, setActiveMatchIndex] = useState(0);
   const [tempHighlightId, setTempHighlightId] = useState(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
+  const [seenIncoming, setSeenIncoming] = useState(0);
+
+  const marker = unreadMarker && unreadMarker.roomId === contact?.roomId ? unreadMarker : null;
+
+  // Incoming messages that arrived while the user was scrolled up reading history
+  const incomingCount = useMemo(
+    () => messages.filter(m => m.senderId !== 'me' && m.senderId !== currentUser?.id && !m.isDeleted).length,
+    [messages, currentUser?.id]
+  );
+  const newBelowCount = isAtBottom ? 0 : Math.max(0, incomingCount - seenIncoming);
+
+  useEffect(() => {
+    if (isAtBottom) setSeenIncoming(incomingCount);
+  }, [isAtBottom, incomingCount]);
+
+  // Disappearing messages: hide anything past its expiry, waking exactly when the next one expires
+  const expiresAt = useMemo(() => computeExpiries(messages).expiresAt, [messages]);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const upcoming = [...expiresAt.values()].filter(t => t > now);
+    if (upcoming.length === 0) return;
+    const delay = Math.min(Math.max(Math.min(...upcoming) - Date.now() + 50, 50), 2147483647);
+    const timer = setTimeout(() => setNow(Date.now()), delay);
+    return () => clearTimeout(timer);
+  }, [expiresAt, now]);
+
+  const visibleMessages = useMemo(
+    () => messages.filter(m => !(expiresAt.has(m.id) && expiresAt.get(m.id) <= now)),
+    [messages, expiresAt, now]
+  );
 
   // Flatten for virtualization
   const flattenedItems = useMemo(() => {
-    const activeMessages = messages.filter(m => !m.isDeleted);
-    const groups = groupMessages(activeMessages);
+    const activeMessages = visibleMessages.filter(m => !m.isDeleted);
+    const groups = groupMessages(activeMessages, marker?.messageId);
     const items = [];
     let lastDateLabel = null;
 
@@ -67,23 +122,73 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
       });
     });
     return items;
-  }, [messages]);
+  }, [visibleMessages, marker?.messageId]);
+
+  const unreadGroupIndex = useMemo(() => flattenedItems.findIndex(g => g.startsUnread), [flattenedItems]);
 
   // Find matches
   const matches = useMemo(() => {
     if (!searchQuery.trim()) return [];
     const query = searchQuery.toLowerCase();
-    return messages.filter(m => {
+    return visibleMessages.filter(m => {
       if (m.isDeleted) return false;
       if (m.type === 'text' && m.text?.toLowerCase().includes(query)) return true;
       if (m.type === 'file' && m.file?.name?.toLowerCase().includes(query)) return true;
       return false;
     });
-  }, [messages, searchQuery]);
+  }, [visibleMessages, searchQuery]);
+
+  // Multi-select: ticked messages in chat order, what the bar can do with them, and Esc to leave selection mode
+  const selectedMessages = useMemo(
+    () => visibleMessages.filter(m => selectedIds.includes(m.id) && !m.isDeleted),
+    [visibleMessages, selectedIds]
+  );
+  const allMine = selectedMessages.length > 0 && selectedMessages.every(m => m.senderId === 'me');
+
+  useEffect(() => {
+    if (!selectMode) return;
+    const onKey = (e) => { if (e.key === 'Escape') clearSelect(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selectMode, clearSelect]);
+
+  const copySelected = () => {
+    const text = selectedMessages
+      .filter(m => m.type === 'text' && m.text && !pollPreview(m.text).startsWith('⏱'))
+      .map(m => pollPreview(m.text))
+      .join('\n');
+    if (!text) {
+      setChatAlert({ message: 'Nothing to copy in the selected messages.' });
+      return;
+    }
+    navigator.clipboard.writeText(text);
+    setChatAlert({ type: 'success', message: 'Copied to clipboard' });
+    clearSelect();
+  };
+
+  const forwardSelected = () => {
+    if (selectedMessages.length === 0) return;
+    setForwardingMessage(selectedMessages.length === 1 ? selectedMessages[0] : { __multi: true, messages: selectedMessages });
+    if (selectedMessages.length === 1) clearSelect();
+  };
+
+  const starSelected = async () => {
+    const targets = selectedMessages.filter(m => !m.isStarred);
+    const toStar = targets.length > 0 ? targets : selectedMessages; // all already starred -> unstar them
+    for (const m of toStar) await handleToggleStar(m.id);
+    clearSelect();
+  };
+
+  const deleteSelected = async () => {
+    setConfirmDelete(false);
+    const ids = selectedMessages.map(m => m.id);
+    clearSelect();
+    for (const id of ids) await handleDeleteMessage(id);
+  };
 
   const pinnedMessage = useMemo(() => {
-    return messages.find(m => m.isPinned && !m.isDeleted);
-  }, [messages]);
+    return visibleMessages.find(m => m.isPinned && !m.isDeleted);
+  }, [visibleMessages]);
 
   const handleScrollToMessage = useCallback((msgId) => {
     const groupIndex = flattenedItems.findIndex(g => g.items.some(m => m.id === msgId));
@@ -168,21 +273,24 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
     }
   }, [scrollToMessageId, isFetchingChat, flattenedItems, setScrollToMessageId]);
 
-  // Auto-scroll to bottom on initial chat load or room change
+  // Initial position once per chat: first unread message if there is one, otherwise the latest message.
+  // (New messages afterwards are handled by Virtuoso's followOutput, so a user reading history is not yanked down.)
+  const initialScrollRoomRef = useRef(null);
   useEffect(() => {
-    if (!isFetchingChat && flattenedItems.length > 0 && virtuosoRef.current) {
-      const timer = setTimeout(() => {
-        if (virtuosoRef.current) {
-          virtuosoRef.current.scrollToIndex({
-            index: flattenedItems.length - 1,
-            align: 'end',
-            behavior: 'auto'
-          });
-        }
-      }, 100);
-      return () => clearTimeout(timer);
-    }
-  }, [isFetchingChat, contact?.roomId, flattenedItems.length]);
+    if (isFetchingChat || flattenedItems.length === 0 || !virtuosoRef.current) return;
+    if (initialScrollRoomRef.current === contact?.roomId) return;
+    const timer = setTimeout(() => {
+      if (!virtuosoRef.current) return;
+      initialScrollRoomRef.current = contact?.roomId;
+      setSeenIncoming(incomingCount);
+      if (unreadGroupIndex >= 0) {
+        virtuosoRef.current.scrollToIndex({ index: unreadGroupIndex, align: 'start', behavior: 'auto' });
+      } else {
+        virtuosoRef.current.scrollToIndex({ index: flattenedItems.length - 1, align: 'end', behavior: 'auto' });
+      }
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [isFetchingChat, contact?.roomId, flattenedItems.length, unreadGroupIndex, incomingCount]);
 
   // Scroll to reveal typing indicator or uploading files if at bottom
   useEffect(() => {
@@ -215,11 +323,7 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
 
   const isSeen = (msg) => {
     if (contact?.isChannel) return false;
-    const readList = msg.readByUsers || [];
-    return readList.some(item => {
-      const parsed = typeof item === 'string' ? JSON.parse(item) : item;
-      return parsed?.user_id === contact?.id;
-    });
+    return getMessageReceipts(msg).some(r => r.user_id === contact?.id);
   };
 
   return (
@@ -270,11 +374,48 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
         </div>
       )}
 
+      {/* Multi-select action bar */}
+      {selectMode && (
+        <div className="absolute top-0 left-0 right-0 bg-white border-b border-[#e2e8f0] z-50 px-3 md:px-4 py-2 flex items-center gap-1 shadow-sm animate-fade-in">
+          <button
+            onClick={clearSelect}
+            aria-label="Cancel selection"
+            className="p-1.5 text-[#64748b] hover:bg-[#f1f5f9] rounded-lg transition-colors"
+          >
+            <X size={16} />
+          </button>
+          <span className="text-[13px] font-semibold text-[#0f172a] ml-1">{selectedIds.length} selected</span>
+          <div className="flex-1" />
+          <button onClick={copySelected} title="Copy" className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-semibold text-[#475569] hover:bg-[#f1f5f9] transition-colors">
+            <Copy size={14} /> <span className="hidden sm:inline">Copy</span>
+          </button>
+          <button onClick={forwardSelected} title="Forward" className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-semibold text-[#475569] hover:bg-[#f1f5f9] transition-colors">
+            <Share2 size={14} /> <span className="hidden sm:inline">Forward</span>
+          </button>
+          <button
+            onClick={starSelected}
+            disabled={!allMine}
+            title={allMine ? 'Star' : 'You can only star your own messages'}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-semibold text-[#475569] hover:bg-[#f1f5f9] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <Star size={14} /> <span className="hidden sm:inline">Star</span>
+          </button>
+          <button
+            onClick={() => setConfirmDelete(true)}
+            disabled={!allMine}
+            title={allMine ? 'Delete' : 'You can only delete your own messages'}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-semibold text-[#ef4444] hover:bg-red-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <Trash2 size={14} /> <span className="hidden sm:inline">Delete</span>
+          </button>
+        </div>
+      )}
+
       {/* Pinned Message Banner */}
       {pinnedMessage && (
         <div className={clsx(
           "flex items-center justify-between px-4 md:px-6 py-2 bg-slate-50 border-b border-[#e2e8f0] z-10 animate-slide-down relative shadow-xs",
-          isSearchOpen && "mt-12"
+          (isSearchOpen || selectMode) && "mt-12"
         )}>
           <div 
             onClick={() => handleScrollToMessage(pinnedMessage.id)}
@@ -284,7 +425,7 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
             <div className="text-[12px] min-w-0">
               <span className="font-bold text-slate-700">Pinned Message</span>
               <p className="text-slate-500 truncate mt-0.5 max-w-full">
-                {pinnedMessage.type === 'file' ? `📁 ${pinnedMessage.file?.name || 'File'}` : pinnedMessage.text}
+                {pinnedMessage.type === 'file' ? `📁 ${pinnedMessage.file?.name || 'File'}` : pollPreview(pinnedMessage.text)}
               </p>
             </div>
           </div>
@@ -308,7 +449,7 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
             atBottomStateChange={(bottom) => setIsAtBottom(bottom)}
             data={flattenedItems}
             computeItemKey={(index, item) => item.id}
-            initialTopMostItemIndex={flattenedItems.length - 1}
+            initialTopMostItemIndex={unreadGroupIndex >= 0 ? { index: unreadGroupIndex, align: 'start' } : flattenedItems.length - 1}
             followOutput={(isAtBottom) => {
               // If we went from 0 to N items, it's an initial load, so jump instantly
               if (prevItemsLengthRef.current === 0) return 'auto';
@@ -354,9 +495,25 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
               const isMe = group.senderId === 'me' || group.senderId === currentUser?.id;
               const sender = getSender(group.senderId);
 
+              if (group.system) {
+                return (
+                  <div className="pb-1 pt-1" key={group.id}>
+                    {group.showDivider && <DateDivider label={group.dateLabel} />}
+                    {group.startsUnread && <UnreadDivider count={marker?.count || 0} />}
+                    <div className="flex justify-center px-6 py-2">
+                      <span className="inline-flex items-center gap-1.5 max-w-[90%] text-center text-[11.5px] font-medium text-slate-500 bg-slate-100 border border-slate-200 rounded-full px-3 py-1">
+                        <Timer size={12} className="shrink-0 text-slate-400" />
+                        {disappearingNotice(group.system.secs, isMe ? 'You' : sender.name)}
+                      </span>
+                    </div>
+                  </div>
+                );
+              }
+
               return (
                 <div className="pb-1 pt-1" key={group.id}>
                   {group.showDivider && <DateDivider label={group.dateLabel} />}
+                  {group.startsUnread && <UnreadDivider count={marker?.count || 0} />}
                   <div className={clsx('flex gap-3 px-6 py-1 group transition-colors duration-150', isMe && 'flex-row-reverse')}>
                     {/* Avatar - Only for incoming messages */}
                     <div className={clsx('flex-shrink-0 w-8 self-start mt-0.5', isMe && 'hidden')}>
@@ -390,10 +547,28 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
                         );
 
                         const isHighlighted = (matches.length > 0 && matches[activeMatchIndex]?.id === msg.id) || tempHighlightId === msg.id;
-                        const replyToMessage = msg.replyToMessageId ? messages.find(m => m.id === msg.replyToMessageId) : null;
+                        const replyToMessage = msg.replyToMessageId ? visibleMessages.find(m => m.id === msg.replyToMessageId) : null;
 
                         return (
-                          <div key={msg.id} id={`msg-${msg.id}`}>
+                          <div
+                            key={msg.id}
+                            id={`msg-${msg.id}`}
+                            className={clsx(
+                              selectMode && 'relative flex items-center gap-3 rounded-lg py-0.5 px-1',
+                              selectMode && isMe && 'justify-end',
+                              selectMode && selectedIds.includes(msg.id) && 'bg-indigo-50/70'
+                            )}
+                          >
+                            {selectMode && (
+                              <span
+                                className={clsx(
+                                  'w-5 h-5 shrink-0 rounded-full border flex items-center justify-center transition-colors',
+                                  selectedIds.includes(msg.id) ? 'bg-[#4f46e5] border-[#4f46e5] text-white' : 'border-slate-300 bg-white'
+                                )}
+                              >
+                                {selectedIds.includes(msg.id) && <Check size={12} strokeWidth={3.5} />}
+                              </span>
+                            )}
                             <MessageBubble
                               message={msg}
                               isMe={isMe}
@@ -402,6 +577,14 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
                               isHighlighted={isHighlighted}
                               replyToMessage={replyToMessage}
                             />
+                            {selectMode && (
+                              <div
+                                data-testid="select-overlay"
+                                className="absolute inset-0 z-40 cursor-pointer"
+                                onClick={() => toggleSelect(msg.id)}
+                                onContextMenu={(e) => e.preventDefault()}
+                              />
+                            )}
                           </div>
                         );
                       })}
@@ -449,6 +632,30 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
           </div>
         )}
 
+        {confirmDelete && createPortal(
+          <div className="fixed inset-0 z-[99999] flex items-center justify-center bg-black/40 p-4 animate-fade-in" onClick={() => setConfirmDelete(false)}>
+            <div className="bg-white rounded-xl shadow-xl w-full max-w-[380px] overflow-hidden" onClick={(e) => e.stopPropagation()}>
+              <div className="p-6 flex flex-col items-center text-center">
+                <div className="w-14 h-14 rounded-full bg-red-50 flex items-center justify-center mb-4">
+                  <Trash2 size={24} className="text-[#ef4444]" />
+                </div>
+                <p className="text-[14px] text-slate-600 font-medium">
+                  Delete {selectedMessages.length} message{selectedMessages.length === 1 ? '' : 's'} for everyone?
+                </p>
+              </div>
+              <div className="flex">
+                <button onClick={() => setConfirmDelete(false)} className="flex-1 py-3 text-[14px] font-semibold text-slate-500 hover:bg-slate-200/50 bg-slate-200/40 transition-colors">
+                  Cancel
+                </button>
+                <button onClick={deleteSelected} className="flex-1 py-3 text-[14px] font-bold text-white bg-[#ef4444] hover:bg-[#dc2626] transition-colors">
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+
         {/* Scroll to Bottom Button */}
         {!isAtBottom && flattenedItems.length > 0 && (
           <button
@@ -459,9 +666,15 @@ export function MessageArea({ messages, contact, currentUser, contacts = [], typ
                 behavior: 'smooth'
               });
             }}
+            title={newBelowCount > 0 ? `${newBelowCount} new message${newBelowCount === 1 ? '' : 's'}` : 'Jump to latest'}
             className="absolute bottom-4 right-4 z-40 p-2 bg-white text-[#64748b] hover:text-[#0f172a] rounded-full shadow-md border border-[#e2e8f0] transition-all hover:bg-slate-50 flex items-center justify-center animate-fade-in"
           >
             <ChevronDown size={20} strokeWidth={2.5} />
+            {newBelowCount > 0 && (
+              <span className="absolute -top-2 -right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-[#4f46e5] text-white text-[10px] font-bold flex items-center justify-center shadow-sm">
+                {newBelowCount > 99 ? '99+' : newBelowCount}
+              </span>
+            )}
           </button>
         )}
       </div>

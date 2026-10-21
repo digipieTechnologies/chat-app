@@ -1,5 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
-import { Paperclip, Smile, Send, AtSign, Bold, Italic, X, ChevronDown, UserPlus } from 'lucide-react';
+import { Paperclip, Smile, Send, AtSign, Bold, Italic, X, ChevronDown, UserPlus, BarChart3 } from 'lucide-react';
+import { CreatePollModal } from './chat/CreatePollModal';
+import { parsePoll, pollPreview } from '../utils/poll';
+import { parseDisappearing } from '../utils/disappearing';
 import { IconButton } from './ui/IconButton';
 import { Avatar } from './ui/Avatar';
 import clsx from 'clsx';
@@ -59,8 +62,9 @@ export function MessageInput({ onSendMessage, onTyping, contacts = [], onViewFil
   const [isEmpty, setIsEmpty]     = useState(true);
   const [pendingFiles, setPendingFiles] = useState([]);
   const [openAddMenuId, setOpenAddMenuId] = useState(null);
-  
-  const { currentContact, handleAddParticipantToGroup, setChatAlert, editingMessage, setEditingMessage, handleEditMessage, quoteMessage, setQuoteMessage, allMessages, setShowEditTimeLimitModal, drafts, saveDraft, globalSharedFile, setGlobalSharedFile } = useChat();
+  const [pollOpen, setPollOpen] = useState(false);
+
+  const { handleSendPoll, currentContact, handleAddParticipantToGroup, setChatAlert, editingMessage, setEditingMessage, handleEditMessage, quoteMessage, setQuoteMessage, allMessages, setShowEditTimeLimitModal, drafts, saveDraft, globalSharedFile, setGlobalSharedFile } = useChat();
 
   const isUserInChat = (userId) => {
     if (!currentContact?.isChannel) return true;
@@ -298,7 +302,7 @@ export function MessageInput({ onSendMessage, onTyping, contacts = [], onViewFil
   const onKey = (e) => {
     if (e.key === 'ArrowUp' && isEmpty) {
       e.preventDefault();
-      const myMessages = (allMessages || []).filter(m => m.senderId === 'me' && m.type === 'text' && !m.isDeleted);
+      const myMessages = (allMessages || []).filter(m => m.senderId === 'me' && m.type === 'text' && !m.isDeleted && !parsePoll(m.text) && !parseDisappearing(m.text));
       if (myMessages.length > 0) {
         const lastMsg = myMessages[myMessages.length - 1];
         
@@ -402,6 +406,8 @@ export function MessageInput({ onSendMessage, onTyping, contacts = [], onViewFil
             />
           </div>
         )}
+
+        <CreatePollModal isOpen={pollOpen} onClose={() => setPollOpen(false)} onCreate={handleSendPoll} />
 
         {/* Mentions Dropdown */}
         {mentionState && filteredMentions.length > 0 && (
@@ -524,7 +530,7 @@ export function MessageInput({ onSendMessage, onTyping, contacts = [], onViewFil
           <div className="flex items-center justify-between bg-indigo-50/80 px-4 py-2 text-[12px] text-[#475569] border-b border-[#e2e8f0]">
             <div className="flex flex-col gap-0.5 overflow-hidden">
               <span className="font-semibold text-indigo-600">Replying to {quoteMessage.senderName || 'Someone'}</span>
-              <span className="truncate max-w-full opacity-80 text-[11px]">{quoteMessage.text || 'Attachment'}</span>
+              <span className="truncate max-w-full opacity-80 text-[11px]">{pollPreview(quoteMessage.text) || 'Attachment'}</span>
             </div>
             <button 
               onClick={() => setQuoteMessage(null)}
@@ -582,6 +588,7 @@ export function MessageInput({ onSendMessage, onTyping, contacts = [], onViewFil
             />
             <IconButton icon={Paperclip}  title="Attach file" onClick={() => fileInputRef.current?.click()} />
             <IconButton icon={AtSign}     title="Mention"  onClick={triggerAtSymbol} />
+            {!editingMessage && <IconButton icon={BarChart3} title="Create poll" onClick={() => setPollOpen(true)} />}
             <IconButton
               icon={Smile}
               title="Emoji"
