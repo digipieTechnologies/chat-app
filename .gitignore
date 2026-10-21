@@ -28,3 +28,5 @@ config.bat
 
 # Playwright MCP test artifacts (screenshots, snapshots, logs)
 .playwright-mcp/
+
+# Local environment variables (Supabase keys)
